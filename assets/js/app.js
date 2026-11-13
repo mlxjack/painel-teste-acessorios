@@ -1,0 +1,1291 @@
+// Catálogo de Acessórios V2 - Chumbada Oficial
+// Controlador principal da SPA (Single Page Application)
+
+const PRODUCTS = window.PRODUCTS;
+const CONFIG = window.CONFIG;
+const PRODUCT_INDICATORS = window.PRODUCT_INDICATORS || {};
+
+// Estado global simples para persistir filtros ao voltar de um produto
+const state = {
+  searchQuery: '',
+  selectedCategory: 'Todos',
+  selectedColor: {},     // Salva cor selecionada por id de produto: { [productId]: colorName }
+  selectedVariation: {}, // Salva variação selecionada por id de produto: { [productId]: varIndex }
+};
+
+// Elementos estáticos do DOM
+const appContainer = document.getElementById('app');
+const logoNav = document.getElementById('logo-nav');
+
+// Inicialização da aplicação
+function init() {
+  try {
+    router(true);
+    window.addEventListener('hashchange', () => router());
+  } catch (err) {
+    console.error("Erro na inicialização do roteador:", err);
+  }
+}
+
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}
+
+// Reset de busca ao clicar no logotipo
+if (logoNav) {
+  logoNav.addEventListener('click', () => {
+    state.searchQuery = '';
+    state.selectedCategory = 'Todos';
+  });
+}
+
+// Roteador SPA baseado em Hash
+function router(initial) {
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const run = () => { routeRender(); if (window.Motion) window.Motion.refresh(); };
+  if (!initial && document.startViewTransition && !reduce) {
+    try { const vt = document.startViewTransition(run); vt.ready.catch(() => {}); vt.updateCallbackDone.catch(() => {}); vt.finished.catch(() => {}); } catch (e) { run(); }
+  } else {
+    run();
+  }
+}
+
+function routeRender() {
+  const hash = window.location.hash || '#/';
+
+  // Rolar para o topo ao mudar de rota de forma compatível e segura
+  try {
+    window.scrollTo({ top: 0, behavior: 'auto' });
+  } catch (e) {
+    window.scrollTo(0, 0);
+  }
+
+  // Rota do Produto: #/produto/slug-do-produto
+  const productMatch = hash.match(/^#\/produto\/([\w-]+)$/);
+
+  if (productMatch) {
+    const slug = productMatch[1];
+    const product = PRODUCTS.find(p => p.slug === slug);
+    if (product) {
+      renderProductDetail(product);
+      updateSEOMeta(product.name, product.description);
+    } else {
+      // Produto não encontrado -> volta para catálogo
+      window.location.hash = '#/';
+    }
+  } else if (hash === '#/pesqueiro') {
+    // Link direto: catálogo já filtrado em "Pesqueiro"
+    state.selectedCategory = 'Pesqueiro';
+    renderCatalog();
+    updateSEOMeta(
+      "Pesqueiro | Chumbada Oficial",
+      "Tudo para pesca em pesqueiro: secretárias, estilingue, anzóis, chumbadas, destorcedores, snaps, stoppers e mais."
+    );
+  } else if (hash === '#/linha-eco') {
+    // Rota da Linha ECO: página em destaque com os produtos em material reaproveitado
+    renderEcoLine();
+    updateSEOMeta(
+      "Linha ECO | Chumbada Oficial",
+      "Conheça a Linha ECO da Chumbada Oficial: acessórios feitos com plástico reaproveitado, mesma qualidade de sempre com menos desperdício."
+    );
+  } else {
+    // Rota padrão (Catálogo / Home)
+    renderCatalog();
+    updateSEOMeta(
+      "Catálogo de Acessórios | Chumbada Oficial",
+      "Explore o catálogo completo de acessórios premium da Chumbada Oficial. Linhas, vestuário técnico, suportes e montagens de alta performance esportiva."
+    );
+  }
+}
+
+// Marca o item ativo do menu principal (Produtos / Linha ECO), limpando os
+// outros. Chamada por renderCatalog, renderEcoLine e renderProductDetail.
+function setActiveNav(id) {
+  const navHome = document.getElementById('nav-home');
+  const navEco = document.getElementById('nav-eco');
+  if (navHome) navHome.classList.toggle('active', id === 'nav-home');
+  if (navEco) navEco.classList.toggle('active', id === 'nav-eco');
+}
+
+// Atualizar títulos e metadados SEO dinamicamente
+function updateSEOMeta(title, description) {
+  document.title = title;
+  const metaDesc = document.querySelector('meta[name="description"]');
+  if (metaDesc) {
+    metaDesc.setAttribute('content', description.substring(0, 160));
+  }
+}
+
+// Função auxiliar para escapar caracteres HTML e evitar XSS
+function escapeHTML(str) {
+  if (!str) return '';
+  return String(str).replace(/[&<>'"]/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+  }[c]));
+}
+
+// Converte um preço exibido ("R$ 190,00") pro número usado pela Minha Seleção
+function parsePriceBRL(str) {
+  if (!str) return 0;
+  const m = String(str).match(/\d[\d.]*(?:,\d+)?/);
+  if (!m) return 0;
+  const num = parseFloat(m[0].replace(/\./g, '').replace(',', '.'));
+  return isNaN(num) ? 0 : num;
+}
+
+// Cor e variação "gêmeas": quando as duas listas têm o mesmo nome (ex.: atrativos
+// holográficos), escolher uma já escolhe a outra. Sem isso o cliente poderia montar
+// uma combinação que não existe no Shopify e o pedido sairia sem SKU.
+function twinVarIndex(p, colorName) {
+  if (!p.vars || !p.swatches || !colorName) return -1;
+  const n = normalizeText(colorName).trim();
+  return p.vars.findIndex((v) => normalizeText(v[0]).trim() === n);
+}
+
+function twinColorName(p, varName) {
+  if (!p.vars || !p.swatches || !varName) return '';
+  const n = normalizeText(varName).trim();
+  const s = p.swatches.find((sw) => normalizeText(sw[0]).trim() === n);
+  return s ? s[0] : '';
+}
+
+// Acha o SKU real do Shopify (produto.skuVariants, importado do CSV) que bate
+// com a cor + variação que o cliente selecionou agora. Só retorna um SKU
+// quando existe exatamente UMA correspondência — quando a combinação é
+// ambígua (ex: o site só mostra tamanho, mas o Shopify tem tamanho+cor com
+// SKUs diferentes) ou não existe skuVariants pro produto, retorna null em vez
+// de arriscar mandar o código errado pro vendedor.
+function findSkuEntry(p, colorName, varLabel) {
+  if (!p.skuVariants || !p.skuVariants.length) return null;
+  // Produto sem nada para escolher e com um único SKU no Shopify: é esse.
+  const unicos = Array.from(new Set(p.skuVariants.map((c) => c.sku).filter(Boolean)));
+  if (unicos.length === 1 && !(p.swatches && p.swatches.length) && !(p.vars && p.vars.length > 1)) {
+    return p.skuVariants.find((c) => c.sku === unicos[0]);
+  }
+  const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').trim();
+  const wanted = [colorName, varLabel].filter(Boolean).map(norm);
+  if (!wanted.length) return null;
+
+  // Combined size/pack labels explicitly identify a single imported SKU.
+  const labeled = p.skuVariants.filter(v => v.label && norm(v.label) === norm(varLabel)
+    && (!colorName || (v.opts || []).map(norm).includes(norm(colorName))));
+  if (labeled.length === 1) return labeled[0];
+
+
+  // Exact match first — a substring check alone would wrongly match "G"
+  // against a variant option of "GG" (since "GG".includes("g")).
+  let candidates = p.skuVariants.filter((v) => {
+    const optsN = (v.opts || []).map(norm);
+    return wanted.every((w) => optsN.includes(w));
+  });
+  if (!candidates.length) {
+    // Substring fallback só vale para textos com 3+ caracteres — opções
+    // curtas como "P" ou "6" (tamanho/modelo) podem aparecer por acaso
+    // dentro de qualquer frase genérica (ex: "6 modelos disponíveis"
+    // contém "6"), o que causaria uma correspondência falsa.
+    candidates = p.skuVariants.filter((v) => {
+      const optsN = (v.opts || []).map(norm);
+      return wanted.every((w) => optsN.some((o) => {
+        if (o === w) return true;
+        return Math.min(o.length, w.length) >= 3 && (o.includes(w) || w.includes(o));
+      }));
+    });
+  }
+  const skus = Array.from(new Set(candidates.map((c) => c.sku).filter(Boolean)));
+  if (skus.length !== 1) return null;
+  return candidates.find((c) => c.sku === skus[0]);
+}
+
+function resolveSku(p, colorName, varLabel) {
+  const entry = findSkuEntry(p, colorName, varLabel);
+  return entry ? String(entry.sku).replace(/^'/, '') : null;
+}
+
+// Função auxiliar para normalizar textos para pesquisa (remover acentos)
+function normalizeText(str) {
+  return String(str)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+// Verifica se o nome do arquivo de uma imagem "casa" com um texto de varia\u00e7\u00e3o/cor
+function imageMatchesText(imgSrc, text) {
+  if (!text || !imgSrc) return false;
+  const parts = imgSrc.split('/');
+  const filename = parts[parts.length - 1];
+  const normFile = normalizeText(filename);
+  const normalizedText = normalizeText(text).replace(/\s+/g, '-');
+  const normalizedTextNoSpace = normalizeText(text).replace(/\s+/g, '');
+  // Rótulos curtos (P, M, G, GG...) só casam como palavra inteira do nome do
+  // arquivo; senão o "p" de ".jpg" ou o "m" de qualquer nome casaria com tudo.
+  if (normalizedTextNoSpace.length < 3) {
+    return normFile.replace(/\.[a-z0-9]+$/, '').split(/[^a-z0-9]+/).includes(normalizedTextNoSpace);
+  }
+  return normFile.includes(normalizedText) || normFile.includes(normalizedTextNoSpace) || normalizedTextNoSpace.includes(normFile.replace(/\.[\w]+$/, '').replace(/-/g, ''));
+}
+
+// ==========================================
+// Indicadores visuais por foto (badge no canto inferior esquerdo)
+// Usa window.PRODUCT_INDICATORS (definido em data.js) para saber, produto a
+// produto e imagem a imagem, o que desenhar. Produtos sem entrada no mapa
+// n\u00e3o s\u00e3o afetados \u2014 a fun\u00e7\u00e3o simplesmente retorna null e nada \u00e9 renderizado.
+// ==========================================
+
+// Bolinhas de tipo, uma cor por categoria (pedido do cliente).
+const CHICOTE_TYPE_STYLE = {
+  'Finesse':   { color: '#777D84', dots: 1 },
+  'Beira':     { color: '#1478E6', dots: 2 },
+  'Meia \u00c1gua': { color: '#F2B705', dots: 3 },
+  'Fundo':     { color: '#E31B2B', dots: 4 },
+};
+
+// Duas escalas: miniatura (thumb) e foto principal (main). Mesma l\u00f3gica de
+// desenho para as duas, s\u00f3 muda o preset de tamanhos/posi\u00e7\u00f5es. Layout em 3
+// linhas: bolinhas (centralizadas, acima) \u2192 linha+pontas+componente \u2192 medida.
+const INDICATOR_PRESETS = {
+  thumb: {
+    w: 60, h: 26, dotR: 1.7, dotGap: 4.5, dotY: 5,
+    lineX1: 20, lineX2: 50, lineY: 15, strokeW: 1.6,
+    endRX: 1.9, endRY: 1.2, diagLen: 3,
+    vSize: 1.9, beadR: 1.7,
+    textY: 24, fontSize: 7.5,
+  },
+  main: {
+    w: 150, h: 44, dotR: 4, dotGap: 11, dotY: 9,
+    lineX1: 42, lineX2: 108, lineY: 27, strokeW: 3,
+    endRX: 4.2, endRY: 2.8, diagLen: 6.5,
+    vSize: 4.3, beadR: 3.7,
+    textY: 40, fontSize: 12,
+  },
+};
+
+// Busca a ficha do indicador (tipo/medida/linha/pontas/componente) para uma
+// imagem espec\u00edfica de um produto. Associa\u00e7\u00e3o \u00e9 pelo NOME do arquivo, nunca
+// pela posi\u00e7\u00e3o na galeria \u2014 se o produto ou a imagem n\u00e3o tiverem entrada no
+// mapa, retorna null (nenhum indicador \u00e9 desenhado).
+function getIndicatorMeta(p, imgSrc) {
+  if (!imgSrc) return null;
+  const map = PRODUCT_INDICATORS[p.slug];
+  if (!map) return null;
+  const basename = imgSrc.split('/').pop();
+  return map[basename] || null;
+}
+
+// Desenha o badge SVG (bolinhas de tipo, linha, acabamento das pontas,
+// componente central e texto da medida) para uma ficha de indicador.
+function buildIndicatorSVG(meta, variant) {
+  const P = INDICATOR_PRESETS[variant];
+  const typeStyle = CHICOTE_TYPE_STYLE[meta.tipo];
+  if (!P || !typeStyle) return '';
+
+  // Bolinhas de tipo: centralizadas acima da linha, em fileira
+  const lineMidX = (P.lineX1 + P.lineX2) / 2;
+  const dotsStartX = lineMidX - ((typeStyle.dots - 1) / 2) * P.dotGap;
+  let dots = '';
+  for (let i = 0; i < typeStyle.dots; i++) {
+    dots += `<circle cx="${dotsStartX + i * P.dotGap}" cy="${P.dotY}" r="${P.dotR}" fill="${typeStyle.color}"/>`;
+  }
+
+  const lineColor = meta.linha === 'vermelha' ? '#E31B2B' : '#C9CED4';
+  const line = `<line x1="${P.lineX1}" y1="${P.lineY}" x2="${P.lineX2}" y2="${P.lineY}" stroke="${lineColor}" stroke-width="${P.strokeW}" stroke-linecap="round"/>`;
+
+  // Acabamento das pontas: stopper (bolinha oval preta) ou n\u00f3 de correr
+  // (risco diagonal vermelho) \u2014 nunca os dois juntos.
+  let ends;
+  if (meta.pontas === 'stopper') {
+    ends = `<ellipse cx="${P.lineX1}" cy="${P.lineY}" rx="${P.endRX}" ry="${P.endRY}" fill="#111111"/>` +
+           `<ellipse cx="${P.lineX2}" cy="${P.lineY}" rx="${P.endRX}" ry="${P.endRY}" fill="#111111"/>`;
+  } else {
+    const d = P.diagLen;
+    ends = `<line x1="${P.lineX1 - d / 2}" y1="${P.lineY - d / 2}" x2="${P.lineX1 + d / 2}" y2="${P.lineY + d / 2}" stroke="#E31B2B" stroke-width="${P.strokeW * 0.75}" stroke-linecap="round"/>` +
+           `<line x1="${P.lineX2 - d / 2}" y1="${P.lineY - d / 2}" x2="${P.lineX2 + d / 2}" y2="${P.lineY + d / 2}" stroke="#E31B2B" stroke-width="${P.strokeW * 0.75}" stroke-linecap="round"/>`;
+  }
+
+  // Componente central: rotor de engate r\u00e1pido ("V" duplo preto) ou mi\u00e7anga
+  // rotor (2 c\u00edrculos furados: centro branco, contorno preto).
+  const midX = (P.lineX1 + P.lineX2) / 2;
+  const gap = (P.lineX2 - P.lineX1) * 0.22;
+  let center = '';
+  if (meta.componente === 'engate') {
+    const vs = P.vSize;
+    [midX - gap, midX + gap].forEach(cx => {
+      center += `<path d="M ${cx - vs} ${P.lineY - vs} L ${cx} ${P.lineY + vs * 0.5} L ${cx + vs} ${P.lineY - vs}" fill="none" stroke="#111111" stroke-width="${P.strokeW * 0.6}" stroke-linecap="round" stroke-linejoin="round"/>`;
+    });
+  } else {
+    [midX - gap, midX + gap].forEach(cx => {
+      center += `<circle cx="${cx}" cy="${P.lineY}" r="${P.beadR}" fill="#ffffff" stroke="#111111" stroke-width="1"/>`;
+    });
+  }
+
+  const text = `<text x="${P.w / 2}" y="${P.textY}" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="${P.fontSize}" font-weight="700" fill="#111111">${escapeHTML(meta.medida)}</text>`;
+
+  return `<svg class="prod-indicator prod-indicator--${variant}" viewBox="0 0 ${P.w} ${P.h}" width="${P.w}" height="${P.h}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style="display:block;pointer-events:none;">
+    <rect x="0.5" y="0.5" width="${P.w - 1}" height="${P.h - 1}" rx="4" fill="rgba(255,255,255,0.85)" stroke="rgba(17,17,17,0.08)"/>
+    ${dots}${line}${ends}${center}${text}
+  </svg>`;
+}
+
+// Monta o HTML do slot posicionado (canto inferior esquerdo, pointer-events:none)
+// que envolve o SVG do indicador \u2014 usado tanto nas miniaturas quanto na foto principal.
+function buildIndicatorSlotHTML(meta, variant, extraStyle) {
+  if (!meta) return '';
+  const svg = buildIndicatorSVG(meta, variant);
+  if (!svg) return '';
+  return `<span class="prod-indicator-slot" style="position:absolute;left:3px;bottom:3px;pointer-events:none;line-height:0;z-index:3;${extraStyle || ''}">${svg}</span>`;
+}
+
+// Em produtos com muitas varia\u00e7\u00f5es/cores, mostra s\u00f3 as fotos gen\u00e9ricas + as da op\u00e7\u00e3o
+// selecionada, escondendo o restante at\u00e9 o cliente clicar na varia\u00e7\u00e3o correspondente.
+// O v\u00eddeo do produto (se houver) nunca \u00e9 afetado por esse filtro.
+function getComboImage(p, colorName, varName) {
+  if (!p.variantImageMap) return null;
+  return p.variantImageMap[`${varName}::${colorName}`] || p.variantImageMap[varName] || null;
+}
+
+function getVisibleGalleryImages(p, colorName, varName) {
+  if (!p.images) return [];
+
+  // Modo estrito: produto com mapa exato foto -> variação (só mostra a foto da combinação
+  // de cor/variação ativa, mais as fotos listadas em alwaysVisibleImages, ex.: fotos de uso)
+  if (p.variantImageMap) {
+    const comboImg = getComboImage(p, colorName, varName);
+    const first = comboImg || p.img || p.images[0];
+    const extras = (p.alwaysVisibleImages || []).filter(img => img !== first);
+    return [first, ...extras];
+  }
+
+  const varLabels = p.vars ? p.vars.map(v => v[0]) : [];
+  const colorLabels = p.swatches ? p.swatches.map(s => s[0]) : [];
+  if (varLabels.length + colorLabels.length <= 1) return p.images.slice();
+
+  const allLabels = [...varLabels, ...colorLabels];
+  const alwaysVisible = p.alwaysVisibleImages || [];
+  const isVariantSpecific = img => !alwaysVisible.includes(img) && allLabels.some(label => imageMatchesText(img, label));
+  const matchesActive = img => imageMatchesText(img, colorName) || imageMatchesText(img, varName);
+
+  const filtered = p.images.filter(img => !isVariantSpecific(img) || matchesActive(img));
+  return filtered.length > 0 ? filtered : p.images.slice();
+}
+
+// Monta o HTML das miniaturas da galeria (imagens filtradas + bot\u00e3o(\u00f5es) de v\u00eddeo, sempre vis\u00edveis)
+function buildGalleryThumbsHTML(p, images) {
+  const videos = p.videos || (p.video ? [p.video] : []);
+  return `
+    ${images.map((img, i) => `
+      <button class="thumb-btn ${i === 0 ? 'active' : ''}" data-type="image" data-src="${img}" type="button" aria-label="Ver imagem ${i + 1}">
+        <img src="${img}" alt="" onerror="this.src='assets/images/chumbada-oficial-27c01352.png'">
+        ${buildIndicatorSlotHTML(getIndicatorMeta(p, img), 'thumb')}
+      </button>
+    `).join('')}
+    ${videos.map((v, i) => `
+      <button class="thumb-btn thumb-video-btn" data-type="video" data-video-src="${v}" type="button" aria-label="Ver v\u00eddeo${videos.length > 1 ? ' ' + (i + 1) : ''} do produto">
+        <div class="play-icon-overlay">
+          <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+            <path d="M8 5v14l11-7z"/>
+          </svg>
+        </div>
+        <video src="${v}" muted autoplay loop playsinline disablepictureinpicture></video>
+      </button>
+    `).join('')}
+  `;
+}
+
+
+// ==========================================
+// Banners por produto (assets/img/banners/<slug>.webp, mapa em banners.js)
+// Associação exata por slug: produto sem entrada em PRODUCT_BANNERS não recebe banner.
+// ==========================================
+const PRODUCT_BANNERS = window.PRODUCT_BANNERS || {};
+function hasBanner(p) { return Object.prototype.hasOwnProperty.call(PRODUCT_BANNERS, p.slug); }
+function bannerImgHTML(p, loading) {
+  return `<img src="assets/img/banners/${p.slug}.webp" srcset="assets/img/banners/${p.slug}-sm.webp 800w, assets/img/banners/${p.slug}.webp 1600w" sizes="(max-width: 768px) 640px, 1200px" width="1600" height="533" alt="Banner ${escapeHTML(p.name)}" loading="${loading || 'lazy'}" decoding="async">`;
+}
+
+// Troca a foto principal com uma entrada suave (sem mexer em layout)
+function swapMainImg(img, src) {
+  img.src = src;
+  img.classList.remove('swap');
+  void img.offsetWidth;
+  img.classList.add('swap');
+}
+
+// ==========================================
+// 1. RENDERIZAÇÃO DA PÁGINA DE CATÁLOGO (HOME)
+// ==========================================
+
+function renderCatalog() {
+  // Destacar menu
+  setActiveNav('nav-home');
+
+  // Encontrar o produto em destaque (featured: true) ou o primeiro produto
+  const featuredProduct = PRODUCTS.find(p => p.featured) || PRODUCTS[0];
+
+  const totalCats = new Set(PRODUCTS.map(p => p.category)).size;
+  const pesqueiroCount = PRODUCTS.filter(isPesqueiro).length;
+  const eco = window.ECO_LINE || { intro: '', products: [] };
+  const ecoThumbs = eco.products.slice(0, 4).map(e => PRODUCTS.find(p => p.slug === e.slug)).filter(Boolean)
+    .map(p => `<img src="${p.img}" alt="${escapeHTML(p.name)}" loading="lazy" width="112" height="112">`).join('');
+
+  // Estrutura HTML da home (Hero + Vitrine + Faixa ECO + Busca/Filtros + Grid)
+  appContainer.innerHTML = `
+    <div class="view-fade">
+      <section class="hero" aria-label="Apresentação do Catálogo">
+        <div class="hero-line" aria-hidden="true" data-parallax="-0.06">
+          <svg viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
+            <path class="line-path" d="M1180 -20 C1180 220 1010 260 1060 470 S1230 640 1150 720"/>
+            <path class="line-path b" d="M1300 -20 C1290 160 1370 280 1290 420 S1180 520 1215 590"/>
+            <path class="hook" d="M1150 720 C1150 770 1195 790 1215 755 M1215 755 L1205 744 M1215 755 L1226 747"/>
+          </svg>
+        </div>
+        <div class="ripples" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div class="hero-container">
+          <div class="hero-content">
+            <span class="badge-tag">Edição Oficial 2026</span>
+            <h1 class="hero-title">
+              <span class="reveal-line" style="--d:0"><span>Equipamentos de</span></span>
+              <span class="reveal-line accent" style="--d:1"><span>Alta Performance</span></span>
+            </h1>
+            <p class="hero-desc">
+              O catálogo oficial da Chumbada Oficial: acessórios de pesca com fotos, cores, medidas e especificações técnicas completas.
+            </p>
+            <div class="hero-actions">
+              <a href="#catalogo-secao" class="btn btn-primary">Ver Catálogo</a>
+              <a href="https://chumbadas.com.br" target="_blank" rel="noopener" class="btn btn-secondary">Visitar Loja</a>
+              <a href="#/linha-eco" class="btn btn-eco">Linha ECO</a>
+            </div>
+            <div class="hero-stats">
+              <div class="hero-stat"><b data-count="${PRODUCTS.length}">${PRODUCTS.length}</b><span>Produtos</span></div>
+              <div class="hero-stat"><b data-count="${totalCats}">${totalCats}</b><span>Categorias</span></div>
+              <div class="hero-stat"><b data-count="${pesqueiroCount}">${pesqueiroCount}</b><span>Para pesqueiro</span></div>
+            </div>
+          </div>
+
+          <!-- Card de Destaque -->
+          <div class="hero-card" aria-label="Destaque">
+            <a href="#/produto/${featuredProduct.slug}">
+              <div class="hero-card-media">
+                <img src="${featuredProduct.img}" alt="${escapeHTML(featuredProduct.name)}">
+              </div>
+            </a>
+            <div class="hero-card-body">
+              <div class="hero-card-info">
+                <h3>${escapeHTML(featuredProduct.name)}</h3>
+                <p>${escapeHTML(featuredProduct.category)}</p>
+              </div>
+              <span class="hero-card-badge">Destaque</span>
+            </div>
+          </div>
+        </div>
+        <span class="scroll-cue" aria-hidden="true"></span>
+      </section>
+
+      ${eco.products.length ? `
+      <section class="eco-band" aria-label="Linha ECO" data-reveal="zoom">
+        <div class="eco-band-inner">
+          <div>
+            <span class="eyebrow" style="color:#7dffbd">Linha ECO</span>
+            <h2>Menos <em>desperdício</em>, mesma performance</h2>
+            <p>${escapeHTML(eco.intro)}</p>
+            <a href="#/linha-eco" class="btn btn-eco">Conhecer a Linha ECO</a>
+          </div>
+          <div class="eco-thumbs" aria-hidden="true">${ecoThumbs}</div>
+        </div>
+      </section>` : ''}
+
+      <!-- Seção de Busca, Filtros e Grid -->
+      <main class="main-wrap" id="catalogo-secao">
+        <section class="panel" aria-label="Painel de Busca e Filtros">
+          <div class="tools">
+            <div class="chips" id="category-chips" role="group" aria-label="Categorias"></div>
+          </div>
+        </section>
+
+        <div class="summary-bar">
+          <div class="summary-title">
+            <h2>Nossos Produtos</h2>
+            <p>Selecione um produto para ver tamanhos, cores disponíveis, fotos detalhadas e solicitar orçamento.</p>
+          </div>
+          <div class="summary-count" id="products-count">Carregando...</div>
+        </div>
+
+        <div class="products-grid" id="products-grid" aria-live="polite">
+          <!-- Cards serão inseridos por JS -->
+        </div>
+      </main>
+    </div>
+  `;
+
+  // Iniciar componentes do catálogo
+  setupFilters();
+  renderGrid();
+}
+
+// Configurar chips de filtros
+// Configurar chips de filtros (Menu Hamburger Dropdown)
+function setupFilters() {
+  const chipsEl = document.getElementById('category-chips');
+  if (!chipsEl) return;
+
+  const counts = {};
+  PRODUCTS.forEach(p => { counts[p.category] = (counts[p.category] || 0) + 1; });
+  const categories = ['Todos', ...Object.keys(counts).sort((a, b) => a.localeCompare(b, 'pt-BR'))];
+  const countOf = cat => cat === 'Todos' ? PRODUCTS.length : counts[cat];
+
+  chipsEl.innerHTML = categories.map(cat => `
+    <button class="chip ${state.selectedCategory === cat ? 'active' : ''}" type="button" data-category="${escapeHTML(cat)}" aria-pressed="${state.selectedCategory === cat}">
+      ${escapeHTML(cat)} <small>${countOf(cat)}</small>
+    </button>
+  `).join('');
+
+  chipsEl.addEventListener('click', e => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    state.selectedCategory = chip.dataset.category;
+    chipsEl.querySelectorAll('.chip').forEach(c => {
+      const on = c === chip;
+      c.classList.toggle('active', on);
+      c.setAttribute('aria-pressed', on);
+    });
+    chip.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    // Transição fluida ao trocar de categoria
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const update = () => { renderGrid(); if (window.Motion) window.Motion.refresh(); };
+    if (document.startViewTransition && !reduce) { const vt = document.startViewTransition(update); vt.ready.catch(() => {}); vt.updateCallbackDone.catch(() => {}); vt.finished.catch(() => {}); }
+    else update();
+  });
+}
+
+// Produto faz parte da seleção "Pesqueiro"?
+const PESQUEIRO_SET = new Set(window.PESQUEIRO_SLUGS || []);
+function isPesqueiro(p) {
+  return PESQUEIRO_SET.has(p.slug);
+}
+
+// Renderizar o grid de produtos filtrado
+function renderGrid() {
+  const grid = document.getElementById('products-grid');
+  const countLabel = document.getElementById('products-count');
+  if (!grid || !countLabel) return;
+
+  const queryNorm = normalizeText(state.searchQuery);
+
+  // Filtrar produtos com base no estado de busca e categoria
+  const filtered = PRODUCTS.filter(p => {
+    const matchesCategory = state.selectedCategory === 'Todos' ||
+      (state.selectedCategory === 'Pesqueiro' ? isPesqueiro(p) : p.category === state.selectedCategory);
+    
+    let matchesSearch = true;
+    if (queryNorm) {
+      const nameNorm = normalizeText(p.name);
+      const catNorm = normalizeText(p.category);
+      const sectionNorm = normalizeText(p.section || '');
+      const varNamesNorm = p.vars ? p.vars.map(v => normalizeText(v[0])).join(' ') : '';
+      const swatchNamesNorm = p.swatches ? p.swatches.map(s => normalizeText(s[0])).join(' ') : '';
+      
+      matchesSearch = nameNorm.includes(queryNorm) || 
+                      catNorm.includes(queryNorm) || 
+                      sectionNorm.includes(queryNorm) ||
+                      varNamesNorm.includes(queryNorm) ||
+                      swatchNamesNorm.includes(queryNorm);
+    }
+
+    return matchesCategory && matchesSearch;
+  });
+
+  // Atualizar contador de resultados
+  countLabel.textContent = `${filtered.length} produto${filtered.length === 1 ? '' : 's'}${state.selectedCategory === 'Pesqueiro' ? ' para pesqueiro' : ''}`;
+
+  // Se nenhum for encontrado, exibir estado vazio
+  if (filtered.length === 0) {
+    grid.innerHTML = `
+      <div class="empty-results">
+        <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 15.75l-2.489-2.489m0 0a3.375 3.375 0 10-4.773-4.773 3.375 3.375 0 004.774 4.774zM21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <h3>Nenhum produto encontrado</h3>
+        <p>Tente buscar por termos diferentes ou selecione outra categoria.</p>
+      </div>
+    `;
+    return;
+  }
+
+  // Mapear produtos para HTML
+  let lastSection = '';
+  grid.innerHTML = filtered.map((p, idx) => {
+    const pSection = p.section || p.category || 'Outros';
+    let sectionBreak = '';
+    
+    // Separador visual de seções se estiver visualizando todos sem busca ativa
+    if (state.selectedCategory === 'Todos' && !state.searchQuery && pSection !== lastSection) {
+      lastSection = pSection;
+      sectionBreak = `<div class="section-break"><h3>${escapeHTML(pSection)}</h3></div>`;
+    }
+
+    // Configurar spans e classes de layout
+    let spanClass = '';
+
+    // Previews de Cores
+    const swatchesHtml = p.swatches ? `
+      <div class="card-swatches" aria-label="Cores disponíveis">
+        ${p.swatches.map(s => `<span class="card-swatch" style="background: ${escapeHTML(s[1])}" title="${escapeHTML(s[0])}"></span>`).join('')}
+      </div>
+    ` : '';
+
+    // Previews de Variações
+    const varsCountHtml = p.vars ? `
+      <div class="card-vars-count">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <line x1="9" y1="9" x2="15" y2="9"></line>
+          <line x1="9" y1="13" x2="15" y2="13"></line>
+          <line x1="9" y1="17" x2="11" y2="17"></line>
+        </svg>
+        <span>${p.vars.length} variação${p.vars.length === 1 ? '' : 'ões'}</span>
+      </div>
+    ` : '';
+
+    const showPrice = CONFIG.showPrices && p.price;
+    const priceHtml = showPrice ? `<span class="product-card-price">${escapeHTML(p.price)}</span>` : '';
+    const btnStyle = showPrice ? '' : 'width: 100%; text-align: center; justify-content: center;';
+
+    return `
+      ${sectionBreak}
+      <article class="product-card ${spanClass}" data-reveal style="--i:${idx % 8}">
+        <div class="product-card-media">
+          ${window.BN_ACC ? window.BN_ACC.ribbon(p) : ''}
+          ${window.ATACADO ? window.ATACADO.ribbon(p) : ''}
+          ${p.video || (p.videos && p.videos.length) ? `<span class="video-badge">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14" style="margin-right: 4px; vertical-align: middle;">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+            Vídeo
+          </span>` : ''}
+          <img loading="lazy" src="${p.img}" alt="${escapeHTML(p.name)}" onerror="this.src='assets/images/chumbada-oficial-27c01352.png'">
+        </div>
+        <div class="product-card-content">
+          <span class="product-card-cat">${escapeHTML(p.category)}</span>
+          <h3 class="product-card-title">${escapeHTML(p.name)}</h3>
+          
+          <div class="product-card-previews">
+            ${swatchesHtml}
+            ${varsCountHtml}
+          </div>
+          
+          <div class="product-card-footer">
+            ${priceHtml}
+            <a href="#/produto/${p.slug}" class="product-card-action" style="${btnStyle}">Ver Detalhes</a>
+          </div>
+        </div>
+      </article>
+    `;
+  }).join('');
+}
+
+
+// ==========================================
+// 1b. PÁGINA DA LINHA ECO
+// ==========================================
+
+function renderEcoLine() {
+  setActiveNav('nav-eco');
+
+  const eco = window.ECO_LINE || { intro: '', products: [] };
+
+  // Resolve cada entrada da Linha ECO no produto real do catálogo, já
+  // calculando o preço e a foto certos para a variação/cor Eco daquele item.
+  const items = eco.products
+    .map(entry => {
+      const product = PRODUCTS.find(p => p.slug === entry.slug);
+      if (!product) return null;
+
+      let priceText = product.price;
+      if (entry.ecoVariant && product.vars) {
+        const match = product.vars.find(v => v[0] === entry.ecoVariant);
+        if (match && match[1]) priceText = match[1];
+      }
+
+      return { product, ecoVariant: entry.ecoVariant, img: entry.ecoImg || product.img, priceText };
+    })
+    .filter(Boolean);
+
+  appContainer.innerHTML = `
+    <div class="view-fade view-eco">
+      <section class="hero hero-eco" aria-label="Apresentação da Linha ECO">
+        <div class="hero-container">
+          <div class="hero-content">
+            <span class="badge-tag badge-eco">Linha ECO</span>
+            <h1 class="hero-title">Menos <span>desperdício</span>, mesma performance</h1>
+            <p class="hero-desc">${escapeHTML(eco.intro)}</p>
+          </div>
+        </div>
+      </section>
+
+      <main class="main-wrap">
+        <div class="summary-bar">
+          <div class="summary-title">
+            <h2>Produtos da Linha ECO</h2>
+            <p>Feitos com plástico reaproveitado, no mesmo padrão de qualidade Chumbada Oficial.</p>
+          </div>
+          <div class="summary-count">${items.length} produto${items.length === 1 ? '' : 's'}</div>
+        </div>
+
+        <div class="products-grid" aria-live="polite">
+          ${items.map(({ product: p, ecoVariant, img, priceText }) => {
+            const showPrice = CONFIG.showPrices && priceText;
+            const priceHtml = showPrice ? `<span class="product-card-price">${escapeHTML(priceText)}</span>` : '';
+            const btnStyle = showPrice ? '' : 'width: 100%; text-align: center; justify-content: center;';
+            const ecoTagLabel = ecoVariant || '100% Eco';
+
+            return `
+              <article class="product-card" data-reveal>
+                <div class="product-card-media">
+                  <span class="eco-card-badge">Eco</span>
+                  <img loading="lazy" src="${img}" alt="${escapeHTML(p.name)}" onerror="this.src='assets/images/chumbada-oficial-27c01352.png'">
+                </div>
+                <div class="product-card-content">
+                  <span class="product-card-cat">${escapeHTML(p.category)}</span>
+                  <h3 class="product-card-title">${escapeHTML(p.name)}</h3>
+
+                  <div class="product-card-previews">
+                    <span class="eco-color-tag">${escapeHTML(ecoTagLabel)}</span>
+                  </div>
+
+                  <div class="product-card-footer">
+                    ${priceHtml}
+                    <a href="#/produto/${p.slug}" class="product-card-action" style="${btnStyle}">Ver Detalhes</a>
+                  </div>
+                </div>
+              </article>
+            `;
+          }).join('')}
+        </div>
+      </main>
+    </div>
+  `;
+}
+
+
+// ==========================================
+// 2. RENDERIZAÇÃO DA PÁGINA DE DETALHES DO PRODUTO
+// ==========================================
+
+function renderProductDetail(p) {
+  // Desmarcar menu ativo para focar no produto
+  setActiveNav(null);
+
+  // Inicializar estado do produto
+  if (state.selectedColor[p.id] === undefined) {
+    state.selectedColor[p.id] = p.swatches && p.swatches.length > 0 ? p.swatches[0][0] : '';
+  }
+  if (state.selectedVariation[p.id] === undefined) {
+    state.selectedVariation[p.id] = 0; // Primeira variação por padrão
+  }
+  const gemeaInicial = twinVarIndex(p, state.selectedColor[p.id]);
+  if (gemeaInicial !== -1) state.selectedVariation[p.id] = gemeaInicial;
+
+  // Preço da variação ativa ou geral
+  const currentVarIndex = state.selectedVariation[p.id];
+  let priceText = 'Sob Consulta';
+  if (CONFIG.showPrices) {
+    if (p.vars && p.vars[currentVarIndex] && p.vars[currentVarIndex][1]) {
+      priceText = p.vars[currentVarIndex][1];
+    } else if (p.price) {
+      priceText = p.price;
+    }
+  }
+
+  // Galeria: em produtos com muitas variações/cores, mostra inicialmente só as fotos
+  // genéricas + as da opção já selecionada por padrão (o restante aparece ao trocar a opção)
+  const initialVarText = p.vars && p.vars[currentVarIndex] ? p.vars[currentVarIndex][0] : '';
+  const initialColorText = state.selectedColor[p.id] || '';
+  const visibleGalleryImages = getVisibleGalleryImages(p, initialColorText, initialVarText);
+
+  // Montagem da Tabela de Especificações Técnicas (Misturando estáticas e dinâmicas do produto)
+  let specsRows = `
+    <tr>
+      <td class="specs-label">Marca</td>
+      <td class="specs-val">Chumbada Oficial</td>
+    </tr>
+    <tr>
+      <td class="specs-label">Categoria</td>
+      <td class="specs-val">${escapeHTML(p.category)}</td>
+    </tr>
+  `;
+
+  // Mesclar especificações personalizadas do produto (specs: {"Material": "Inox", ...})
+  if (p.specs && typeof p.specs === 'object') {
+    for (const [key, value] of Object.entries(p.specs)) {
+      if (value) {
+        specsRows += `
+          <tr>
+            <td class="specs-label">${escapeHTML(key)}</td>
+            <td class="specs-val">${escapeHTML(value)}</td>
+          </tr>
+        `;
+      }
+    }
+  }
+
+  specsRows += `
+    <tr>
+      <td class="specs-label">Disponibilidade</td>
+      <td class="specs-val" style="color: var(--color-success)">Disponível</td>
+    </tr>
+    <tr>
+      <td class="specs-label">Código de Referência</td>
+      <td class="specs-val">#${String(p.id).padStart(4, '0')}</td>
+    </tr>
+  `;
+
+  // Chips de resumo (apenas dados reais do produto)
+  const chipList = [];
+  if (p.swatches && p.swatches.length) chipList.push(`<b>${p.swatches.length}</b> cor${p.swatches.length === 1 ? '' : 'es'}`);
+  if (p.vars && p.vars.length) chipList.push(`<b>${p.vars.length}</b> opç${p.vars.length === 1 ? 'ão' : 'ões'}`);
+  if (p.video || (p.videos && p.videos.length)) chipList.push('<b>Vídeo</b> do produto');
+  if (isPesqueiro(p)) chipList.push('<b>Pesqueiro</b>');
+  const metaChipsHTML = chipList.length ? `<div class="meta-chips">${chipList.map(c => `<span class="meta-chip"><i></i>${c}</span>`).join('')}</div>` : '';
+
+  // Relacionados: mesma categoria
+  const related = PRODUCTS.filter(x => x.category === p.category && x.id !== p.id).slice(0, 4);
+  const relatedHTML = related.length ? `
+    <section class="related" aria-label="Mais em ${escapeHTML(p.category)}">
+      <div class="section-head" data-reveal>
+        <div><span class="eyebrow">Continue explorando</span><h2 class="section-title">Mais em ${escapeHTML(p.category)}</h2></div>
+      </div>
+      <div class="products-grid">
+        ${related.map((r, i) => `
+          <article class="product-card" data-reveal style="--i:${i}">
+            <a href="#/produto/${r.slug}" class="product-card-media" aria-label="${escapeHTML(r.name)}">
+              <img loading="lazy" src="${r.img}" alt="${escapeHTML(r.name)}" onerror="this.src='assets/images/chumbada-oficial-27c01352.png'">
+            </a>
+            <div class="product-card-content">
+              <span class="product-card-cat">${escapeHTML(r.category)}</span>
+              <h3 class="product-card-title">${escapeHTML(r.name)}</h3>
+              <div class="product-card-footer"><a href="#/produto/${r.slug}" class="product-card-action">Ver Detalhes</a></div>
+            </div>
+          </article>`).join('')}
+      </div>
+    </section>` : '';
+
+  // Renderizar a estrutura de detalhes
+  appContainer.innerHTML = `
+    <div class="view-fade">
+      <main class="main-wrap detail-view">
+        <!-- Breadcrumb para navegação -->
+        <nav class="breadcrumb" aria-label="Navegação de trilha">
+          <a href="#/">Home</a>
+          <span class="breadcrumb-separator">/</span>
+          <a href="#/" onclick="state.selectedCategory = '${escapeHTML(p.category)}'">${escapeHTML(p.category)}</a>
+          <span class="breadcrumb-separator">/</span>
+          <span class="breadcrumb-current" aria-current="page">${escapeHTML(p.name)}</span>
+        </nav>
+
+        ${hasBanner(p) ? `
+        <figure class="detail-banner" data-reveal="zoom">
+          <button type="button" id="banner-zoom" aria-label="Ampliar banner de ${escapeHTML(p.name)}">
+            ${bannerImgHTML(p, 'eager')}
+          </button>
+          <span class="zoom-hint" aria-hidden="true">Ampliar ⤢</span>
+        </figure>` : ''}
+
+        <div class="detail-grid">
+          <!-- Coluna da Esquerda: Galeria Interativa com fotos e vídeo -->
+          <section class="detail-gallery" aria-label="Imagens do Produto">
+            <div class="gallery-main" id="gallery-main-container">
+              <img id="main-product-img" src="${visibleGalleryImages[0] || p.img}" alt="${escapeHTML(p.name)}" onerror="this.src='assets/images/chumbada-oficial-27c01352.png'">
+              <div id="main-product-video" class="gallery-video-wrapper" style="display: none;"></div>
+              <div id="main-product-indicator">${buildIndicatorSlotHTML(getIndicatorMeta(p, visibleGalleryImages[0] || p.img), 'main')}</div>
+            </div>
+            
+            ${(p.images && p.images.length > 1) || p.video || (p.videos && p.videos.length) ? `
+              <div class="gallery-thumbs${p.slug === 'chicotes-montados-3-unidades' ? ' gallery-thumbs--grid4' : ''}" id="gallery-thumbs">
+                ${buildGalleryThumbsHTML(p, visibleGalleryImages)}
+              </div>
+            ` : ''}
+          </section>
+
+          <!-- Coluna da Direita: Informações detalhadas -->
+          <section class="detail-info" aria-label="Informações do Produto">
+            <div class="info-header">
+              <span class="info-cat">${escapeHTML(p.category)}</span>
+              <h1 class="info-title">${escapeHTML(p.name)}</h1>
+              
+              ${CONFIG.showPrices && priceText !== 'Sob Consulta' ? `
+                <div class="info-price-wrapper">
+                  <span class="info-price" id="detail-price-display">${escapeHTML(priceText)}</span>
+                </div>
+              ` : ''}
+            </div>
+
+            ${metaChipsHTML}
+
+            ${p.notice ? `<div class="product-notice" role="note"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg><span>${escapeHTML(p.notice)}</span></div>` : ""}
+
+            <!-- Seletor de Cores -->
+            ${p.swatches ? `
+              <div class="info-section" id="section-colors">
+                <h2 class="info-section-title">
+                  Cor: <span class="info-section-value" id="selected-color-label">${escapeHTML(state.selectedColor[p.id])}</span>
+                </h2>
+                <div class="swatches-selector" role="radiogroup" aria-label="Seleção de Cor">
+                  ${p.swatches.map(s => `
+                    <button class="swatch-btn ${state.selectedColor[p.id] === s[0] ? 'active' : ''}"
+                            style="background: ${escapeHTML(s[1])}"
+                            data-color-name="${escapeHTML(s[0])}"
+                            data-title="${escapeHTML(s[0])}"
+                            type="button"
+                            role="radio"
+                            aria-checked="${state.selectedColor[p.id] === s[0] ? 'true' : 'false'}">
+                    </button>
+                  `).join('')}
+                </div>
+              </div>
+            ` : ''}
+
+            <!-- Seletor de Tamanhos / Variações -->
+            ${p.vars ? `
+              <div class="info-section" id="section-vars">
+                <h2 class="info-section-title">Opções / Variações</h2>
+                <div class="vars-selector" role="radiogroup" aria-label="Seleção de Variação">
+                  ${p.vars.map((v, index) => {
+                    const hasPrice = CONFIG.showPrices && v[1];
+                    const activeClass = currentVarIndex === index ? 'active' : '';
+                    return `
+                      <button class="var-btn ${activeClass}"
+                              data-var-index="${index}"
+                              type="button"
+                              role="radio"
+                              aria-checked="${currentVarIndex === index ? 'true' : 'false'}">
+                        <span class="var-name">${escapeHTML(v[0])}</span>
+                        ${hasPrice ? `<span class="var-price">${escapeHTML(v[1])}</span>` : ''}
+                      </button>
+                    `;
+                  }).join('')}
+                </div>
+              </div>
+            ` : ''}
+
+            <div class="selecao-add-row">
+              <div class="selecao-qty-stepper">
+                <button type="button" id="selecao-qty-dec" aria-label="Diminuir quantidade">−</button>
+                <span id="selecao-qty-value">1</span>
+                <button type="button" id="selecao-qty-inc" aria-label="Aumentar quantidade">+</button>
+              </div>
+              <button type="button" class="btn btn-secondary" id="btn-add-selecao">
+                Adicionar à Minha Seleção
+              </button>
+            </div>
+
+            <!-- Tabela de Especificações Técnicas -->
+            <div class="info-section">
+              <h2 class="info-section-title">Especificações Técnicas</h2>
+              <table class="specs-table">
+                <tbody>
+                  ${specsRows}
+                </tbody>
+              </table>
+            </div>
+
+            <!-- Ações Principais -->
+            <div class="detail-actions">
+              <!-- Botão do WhatsApp (Atendimento/Orçamento) -->
+              <button class="btn btn-primary btn-whatsapp" id="btn-order-whatsapp" type="button">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946C.06 5.348 5.397.01 12.008.01c3.202.001 6.212 1.246 8.477 3.513 2.262 2.268 3.507 5.28 3.505 8.484-.004 6.657-5.34 11.997-11.953 11.997-2.005-.001-3.973-.502-5.724-1.458L0 24zm6.59-4.846c1.6.95 3.188 1.449 4.825 1.451 5.436.002 9.858-4.417 9.86-9.86.001-2.638-1.024-5.117-2.884-6.979C16.59 1.905 14.113.882 11.48.882c-5.441 0-9.863 4.42-9.865 9.861 0 1.682.454 3.32 1.317 4.757l-.988 3.605 3.702-.971zm11.367-7.252c-.3-.149-1.777-.875-2.05-.974-.274-.1-.474-.149-.674.15-.2.299-.774.974-.949 1.173-.174.199-.349.224-.648.075-.3-.15-1.263-.465-2.403-1.482-.888-.793-1.488-1.77-1.663-2.069-.175-.299-.019-.461.13-.61.135-.134.3-.349.449-.523.149-.174.199-.299.299-.498.1-.2.05-.374-.025-.523-.075-.15-.674-1.62-.924-2.22-.243-.585-.49-.507-.674-.516-.174-.008-.374-.01-.574-.01-.2 0-.524.075-.798.374-.274.299-1.048 1.022-1.048 2.492 0 1.47 1.073 2.89 1.223 3.089.15.2 2.11 3.22 5.111 4.516.713.308 1.27.493 1.704.63.716.228 1.368.196 1.883.119.574-.085 1.777-.726 2.025-1.42.249-.696.249-1.293.174-1.418-.075-.125-.274-.199-.573-.349z"/>
+                </svg>
+                Solicitar via WhatsApp
+              </button>
+
+              <div class="action-row">
+                <!-- Botão do Link Oficial (Shopify) se existir -->
+                ${p.link && p.link !== '#' ? `
+                  <a href="${p.link}" target="_blank" rel="noopener" class="btn btn-secondary">
+                    Comprar no Site
+                  </a>
+                ` : `
+                  <button class="btn btn-secondary" style="opacity: 0.5; cursor: not-allowed;" disabled>
+                    Indisponível no Site
+                  </button>
+                `}
+                
+                <!-- Botão Voltar -->
+                <a href="#/" class="btn btn-secondary">
+                  Voltar ao Catálogo
+                </a>
+              </div>
+            </div>
+
+            <!-- Descrição Técnica Premium -->
+            <div class="info-section">
+              <h2 class="info-section-title">Descrição</h2>
+              <div class="info-desc">${p.description}</div>
+            </div>
+          </section>
+        </div>
+        ${relatedHTML}
+      </main>
+    </div>
+  `;
+
+  // Inicializar os seletores interativos
+  initDetailSelectors(p);
+  if (window.BN_ACC) window.BN_ACC.afterDetail(p);
+  if (window.ATACADO) window.ATACADO.afterDetail(p);
+  const bz = document.getElementById('banner-zoom');
+  if (bz && window.Motion) bz.addEventListener('click', () => window.Motion.lightbox(`assets/img/banners/${p.slug}.webp`, `Banner ${p.name}`));
+}
+
+// Configurar comportamento dinâmico nos seletores da página de produto
+function initDetailSelectors(p) {
+  const sectionColors = document.getElementById('section-colors');
+  const sectionVars = document.getElementById('section-vars');
+  const colorLabel = document.getElementById('selected-color-label');
+  const priceDisplay = document.getElementById('detail-price-display');
+  const btnWhatsapp = document.getElementById('btn-order-whatsapp');
+  
+  const galleryThumbs = document.getElementById('gallery-thumbs');
+  const mainImg = document.getElementById('main-product-img');
+  const mainVideoContainer = document.getElementById('main-product-video');
+  const mainIndicator = document.getElementById('main-product-indicator');
+
+  // Controle da Galeria de Imagens e Vídeo
+  if (galleryThumbs && mainImg && mainVideoContainer) {
+    galleryThumbs.addEventListener('click', e => {
+      const btn = e.target.closest('.thumb-btn');
+      if (!btn) return;
+
+      // Atualizar classe ativa do botão selecionado
+      galleryThumbs.querySelectorAll('.thumb-btn').forEach(b => b.classList.toggle('active', b === btn));
+
+      const type = btn.dataset.type;
+
+      if (type === 'image') {
+        mainVideoContainer.style.display = 'none';
+        mainVideoContainer.innerHTML = '';
+        mainImg.style.display = 'block';
+        swapMainImg(mainImg, btn.dataset.src);
+        if (mainIndicator) mainIndicator.innerHTML = buildIndicatorSlotHTML(getIndicatorMeta(p, btn.dataset.src), 'main');
+      } else if (type === 'video') {
+        mainImg.style.display = 'none';
+        mainVideoContainer.style.display = 'flex';
+        if (mainIndicator) mainIndicator.innerHTML = '';
+
+        const videoSrc = btn.dataset.videoSrc;
+        if (videoSrc.includes('youtube.com') || videoSrc.includes('youtu.be') || videoSrc.includes('embed')) {
+          let embedUrl = videoSrc;
+          const ytMatch = videoSrc.match(/(?:youtu\.be\/|youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/);
+          if (ytMatch) {
+            const startMatch = videoSrc.match(/[?&]t=(\d+)s?/);
+            embedUrl = `https://www.youtube.com/embed/${ytMatch[1]}` + (startMatch ? `?start=${startMatch[1]}` : '');
+          }
+          mainVideoContainer.innerHTML = `
+            <iframe src="${embedUrl}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+          `;
+        } else {
+          mainVideoContainer.innerHTML = `
+            <video src="${videoSrc}" controls autoplay muted></video>
+          `;
+        }
+      }
+    });
+  }
+
+  // Função para reconstruir o link do WhatsApp com os dados selecionados
+  function updateWhatsappLink() {
+    const selectedColor = (window.BN_ACC && window.BN_ACC.offLabel(p)) || state.selectedColor[p.id];
+    const varIndex = state.selectedVariation[p.id];
+    const selectedVar = p.vars && p.vars[varIndex] ? p.vars[varIndex][0] : 'Nenhum';
+    
+    // Substituir tokens na mensagem
+    let message = CONFIG.whatsappMessageTemplate
+      .replace('{productName}', p.name)
+      .replace('{category}', p.category)
+      .replace('{variation}', selectedVar)
+      .replace('{color}', selectedColor || 'Nenhum');
+      
+    const url = `https://wa.me/${CONFIG.whatsappNumber}?text=${encodeURIComponent(message)}`;
+    
+    // Associar ação de clique ao botão
+    btnWhatsapp.onclick = () => {
+      window.open(url, '_blank', 'noopener');
+    };
+  }
+
+  function setActiveVar(varIndex) {
+    state.selectedVariation[p.id] = varIndex;
+    if (sectionVars) {
+      sectionVars.querySelectorAll('.var-btn').forEach((b, index) => {
+        const isActive = index === varIndex;
+        b.classList.toggle('active', isActive);
+        b.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      });
+    }
+    if (CONFIG.showPrices && priceDisplay && p.vars && p.vars[varIndex]) {
+      const varPrice = p.vars[varIndex][1] || p.price || 'Sob Consulta';
+      priceDisplay.textContent = varPrice;
+      priceDisplay.classList.toggle('empty', varPrice === 'Sob Consulta');
+    }
+  }
+
+  function setActiveColor(colorName) {
+    state.selectedColor[p.id] = colorName;
+    if (sectionColors) {
+      sectionColors.querySelectorAll('.swatch-btn').forEach(b => {
+        const isActive = b.dataset.colorName === colorName;
+        b.classList.toggle('active', isActive);
+        b.setAttribute('aria-checked', isActive ? 'true' : 'false');
+      });
+    }
+    if (colorLabel) colorLabel.textContent = colorName;
+  }
+
+  // Seletor de Cores
+  if (sectionColors) {
+    sectionColors.addEventListener('click', e => {
+      const btn = e.target.closest('.swatch-btn');
+      if (!btn) return;
+
+      const colorName = btn.dataset.colorName;
+      state.selectedColor[p.id] = colorName;
+
+      // Atualizar classe ativa
+      sectionColors.querySelectorAll('.swatch-btn').forEach(b => {
+        const isActive = b === btn;
+        b.classList.toggle('active', isActive);
+        b.setAttribute('aria-checked', isActive ? 'true' : 'false');
+      });
+
+      // Atualizar texto do label de cor
+      if (colorLabel) colorLabel.textContent = colorName;
+
+      const twinIdx = twinVarIndex(p, colorName);
+      if (twinIdx !== -1 && twinIdx !== state.selectedVariation[p.id]) setActiveVar(twinIdx);
+
+      // Atualizar galeria (revela as fotos da cor selecionada e troca a foto principal)
+      refreshGallery(colorName);
+
+      updateWhatsappLink();
+    });
+  }
+
+  // Seletor de Variações
+  if (sectionVars) {
+    sectionVars.addEventListener('click', e => {
+      const btn = e.target.closest('.var-btn');
+      if (!btn) return;
+
+      const varIndex = parseInt(btn.dataset.varIndex, 10);
+      state.selectedVariation[p.id] = varIndex;
+
+      // Atualizar classe ativa
+      sectionVars.querySelectorAll('.var-btn').forEach((b, index) => {
+        const isActive = index === varIndex;
+        b.classList.toggle('active', isActive);
+        b.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+      });
+
+      // Atualizar exibição de preço para a variação ativa
+      if (CONFIG.showPrices && priceDisplay && p.vars && p.vars[varIndex]) {
+        const varPrice = p.vars[varIndex][1] || p.price || 'Sob Consulta';
+        priceDisplay.textContent = varPrice;
+        priceDisplay.classList.toggle('empty', varPrice === 'Sob Consulta');
+      }
+
+      const twinColor = twinColorName(p, p.vars[varIndex][0]);
+      if (twinColor && twinColor !== state.selectedColor[p.id]) setActiveColor(twinColor);
+
+      // Atualizar galeria (revela as fotos da variação selecionada e troca a foto principal)
+      if (p.vars && p.vars[varIndex]) {
+        refreshGallery(p.vars[varIndex][0]);
+      }
+
+      updateWhatsappLink();
+    });
+  }
+
+  // Reconstrói as miniaturas da galeria mostrando as fotos genéricas + as da opção ativa
+  // (cor e variação), e troca a foto principal para a que combina com o texto recém-selecionado.
+  // O vídeo (se houver) permanece sempre visível, nunca é escondido pelo filtro.
+  function refreshGallery(activeText) {
+    if (!p.images || !galleryThumbs) return;
+
+    const colorName = state.selectedColor[p.id] || '';
+    const varIndex = state.selectedVariation[p.id];
+    const varName = p.vars && p.vars[varIndex] ? p.vars[varIndex][0] : '';
+
+    const visibleImages = getVisibleGalleryImages(p, colorName, varName);
+    galleryThumbs.innerHTML = buildGalleryThumbsHTML(p, visibleImages);
+
+    const matchIndex = visibleImages.findIndex(img => imageMatchesText(img, activeText));
+    const targetSrc = matchIndex !== -1 ? visibleImages[matchIndex] : visibleImages[0];
+
+    if (targetSrc) {
+      mainVideoContainer.style.display = 'none';
+      mainVideoContainer.innerHTML = '';
+      mainImg.style.display = 'block';
+      swapMainImg(mainImg, targetSrc);
+      if (mainIndicator) mainIndicator.innerHTML = buildIndicatorSlotHTML(getIndicatorMeta(p, targetSrc), 'main');
+
+      const thumbBtns = galleryThumbs.querySelectorAll('.thumb-btn[data-type="image"]');
+      thumbBtns.forEach(b => b.classList.toggle('active', b.dataset.src === targetSrc));
+      const activeBtn = Array.from(thumbBtns).find(b => b.dataset.src === targetSrc);
+      if (activeBtn) activeBtn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    }
+  }
+
+  // Inicializar link pela primeira vez
+  updateWhatsappLink();
+
+  // Botão "Adicionar à Minha Seleção"
+  const btnAddSelecao = document.getElementById('btn-add-selecao');
+  const qtyDec = document.getElementById('selecao-qty-dec');
+  const qtyInc = document.getElementById('selecao-qty-inc');
+  const qtyValue = document.getElementById('selecao-qty-value');
+  let selecaoQty = 1;
+
+  if (qtyDec) {
+    qtyDec.addEventListener('click', () => {
+      selecaoQty = Math.max(1, selecaoQty - 1);
+      qtyValue.textContent = selecaoQty;
+    });
+  }
+  if (qtyInc) {
+    qtyInc.addEventListener('click', () => {
+      selecaoQty += 1;
+      qtyValue.textContent = selecaoQty;
+    });
+  }
+  if (btnAddSelecao) {
+    btnAddSelecao.addEventListener('click', () => {
+      if (!window.MinhaSelecao) return;
+      const varIndex = state.selectedVariation[p.id];
+      const bnOff = window.BN_ACC && window.BN_ACC.offLabel(p);
+      const colorName = bnOff || state.selectedColor[p.id];
+      const varLabel = p.vars && p.vars[varIndex] ? p.vars[varIndex][0] : '';
+      const priceStr = (p.vars && p.vars[varIndex] && p.vars[varIndex][1]) ? p.vars[varIndex][1] : p.price;
+      const entry = bnOff ? null : findSkuEntry(p, colorName, varLabel);
+      const basePrice = entry && entry.price > 0 ? entry.price : parsePriceBRL(priceStr);
+      if (!basePrice) return;
+      // Black November: manda o preco com desconto, igual ao exibido na pagina
+      const bnPct = window.BN_ACC && window.BN_ACC.effectivePct ? window.BN_ACC.effectivePct(p) : 0;
+      const unitPrice = bnPct ? Math.round(basePrice * (100 - bnPct)) / 100 : basePrice;
+      const variantParts = [];
+      if (colorName) variantParts.push((bnOff ? window.BN_ACC.fieldLabel(p) : 'Cor') + ': ' + colorName);
+      if (varLabel && !(colorName && normalizeText(varLabel).trim() === normalizeText(colorName).trim())) variantParts.push(varLabel);
+      window.MinhaSelecao.addItem({
+        catalog: 'acessorios',
+        productId: String(p.id),
+        name: p.name,
+        sku: entry ? String(entry.sku).replace(/^'/, '') : (bnOff && window.BN_ACC.offSku ? window.BN_ACC.offSku(p) : null),
+        variant: variantParts.join(', '),
+        qty: selecaoQty,
+        unitPrice,
+      });
+      selecaoQty = 1;
+      qtyValue.textContent = '1';
+    });
+  }
+}
